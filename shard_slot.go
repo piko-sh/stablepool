@@ -39,7 +39,7 @@ func (s *privateSlot[T]) tryTake() *T {
 // holds reports whether the slot currently holds an object, without the write a swap
 // makes to the slot's cache line.
 //
-// Returns bool which is true when the slot was not empty at the moment of the load.
+// Returns bool which is true when the slot was not empty when it was loaded.
 func (s *privateSlot[T]) holds() bool {
 	return s.p.Load() != nil
 }

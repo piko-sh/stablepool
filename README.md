@@ -62,8 +62,13 @@ func main() {
   returns the object.
 - **Options**: `WithGrowth` (extra slabs on demand up to a ceiling), `WithShardCount`
   (default `GOMAXPROCS`, rounded up to a power of two), `WithMetrics` (an in-flight counter,
-  read with `InFlight`), and `WithMode(ModeGCAware)` for `sync.Pool` reclamation behind the
-  same typed API.
+  read with `InFlight`), `WithOverflow` (see below), and `WithMode(ModeGCAware)` for
+  `sync.Pool` reclamation behind the same typed API.
+- **`WithOverflow`** lets a persistent pool serve beyond its slabs. When they run out, `Get`
+  falls back to an internal `sync.Pool` instead of returning nil. Each shard keeps no more
+  than its share of the slab capacity, so the surplus from a burst goes back to the garbage
+  collector. Leaked objects still pin their slab slots, but returned overflow objects take
+  their place on the free stacks, so the pool keeps reusing objects.
 - **`Cap`**, **`MaxCap`** and **`Drain`** report and empty the pool.
 - **Sentinel errors** for invalid construction: `ErrNoInitialiser`, `ErrBadCapacity`,
   `ErrBadGrowth`, `ErrBadShardCount` and `ErrBadLink`.

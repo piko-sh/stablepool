@@ -42,7 +42,10 @@ type shard[T any] struct {
 	// Treiber stack would suffer ABA here and could link an in-use object into the list.
 	freeMu sync.Mutex
 
-	_ [128 - 24]byte
+	// freeCount is the number of objects on the free stack, guarded by freeMu.
+	freeCount int
+
+	_ [128 - 32]byte
 }
 
 // popFree removes and returns the head of this shard's free stack.
@@ -64,6 +67,7 @@ func (s *shard[T]) popFree() *T {
 	}
 	next := (*T)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(head))))
 	s.freeHead.Store(next)
+	s.freeCount--
 	s.freeMu.Unlock()
 	return head
 }
@@ -73,13 +77,22 @@ func (s *shard[T]) popFree() *T {
 // sees the happens-before edge to the popFree() that later reads it.
 //
 // Takes object (*T) which is the object to push onto the free stack head.
+// Takes limit (int) which is the most objects the stack may hold; zero means no limit.
+//
+// Returns bool which is false when the stack is full and the object was not pushed.
 //
 // Concurrency: Acquires freeMu for the duration of the operation.
 //
 //go:nocheckptr
-func (s *shard[T]) pushFree(object *T) {
+func (s *shard[T]) pushFree(object *T, limit int) bool {
 	s.freeMu.Lock()
+	if limit > 0 && s.freeCount >= limit {
+		s.freeMu.Unlock()
+		return false
+	}
 	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(object)), unsafe.Pointer(s.freeHead.Load()))
 	s.freeHead.Store(object)
+	s.freeCount++
 	s.freeMu.Unlock()
+	return true
 }

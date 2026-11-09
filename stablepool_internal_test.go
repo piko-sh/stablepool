@@ -105,3 +105,30 @@ func TestGetPreferParkedHandsEachObjectToOneTaker(t *testing.T) {
 	group.Wait()
 	require.Zero(t, doubled.Load(), "no object is held by two takers at once")
 }
+
+func TestOverflowBoundsWhatTheShardsKeep(t *testing.T) {
+	t.Parallel()
+	pool, err := New(func(*parkedObject) {}, nil, 4, WithShardCount[parkedObject](1), WithOverflow[parkedObject]())
+	require.NoError(t, err)
+	require.Equal(t, 4, pool.shardLimit)
+
+	taken := make([]*parkedObject, 0, 10)
+	for range 10 {
+		object := pool.Get()
+		require.NotNil(t, object)
+		taken = append(taken, object)
+	}
+	for _, object := range taken {
+		pool.Put(object)
+	}
+
+	kept := 0
+	if pool.shards[0].slot.tryTake() != nil {
+		kept++
+	}
+	for pool.shards[0].popFree() != nil {
+		kept++
+	}
+	require.LessOrEqual(t, kept, 1+pool.shardLimit, "the shard keeps its slot and at most its share; the rest go to the overflow")
+	require.Equal(t, 5, kept)
+}

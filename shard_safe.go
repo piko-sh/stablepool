@@ -59,10 +59,18 @@ func (s *shard[T]) popFree() *T {
 // pushFree appends object to the shard's free stack under freeMu.
 //
 // Takes object (*T) which is the object to push onto the free stack.
+// Takes limit (int) which is the most objects the stack may hold; zero means no limit.
+//
+// Returns bool which is false when the stack is full and the object was not pushed.
 //
 // Concurrency: Acquires freeMu for the duration of the operation.
-func (s *shard[T]) pushFree(object *T) {
+func (s *shard[T]) pushFree(object *T, limit int) bool {
 	s.freeMu.Lock()
+	if limit > 0 && len(s.freeStack) >= limit {
+		s.freeMu.Unlock()
+		return false
+	}
 	s.freeStack = append(s.freeStack, object)
 	s.freeMu.Unlock()
+	return true
 }

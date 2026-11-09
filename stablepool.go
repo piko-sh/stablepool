@@ -82,6 +82,11 @@ type Pool[T any] struct {
 	// gcInner backs ModeGCAware operation with a standard sync.Pool.
 	gcInner *sync.Pool
 
+	// overflow, set by WithOverflow in persistent mode, supplies objects once the slabs are
+	// exhausted and takes back objects a full shard cannot keep, so the garbage collector
+	// can free them.
+	overflow *sync.Pool
+
 	// shards holds the per-shard fast slot and free stack for modePersistent.
 	shards []shard[T]
 
@@ -103,6 +108,10 @@ type Pool[T any] struct {
 	// gcFresh counts the objects gcInner.New allocated, so Drain() can tell a cached object
 	// from a fresh one (sync.Pool.Get() never reports nil once New is set).
 	gcFresh atomic.Int64
+
+	// shardLimit is the most objects each shard's free stack keeps when overflow is set.
+	// Zero means no limit.
+	shardLimit int
 
 	// slabsMu guards slabs and capacity during growth.
 	slabsMu sync.Mutex
@@ -140,7 +149,8 @@ func New[T any](initialise func(*T), clean func(*T), capacity int, options ...Op
 		initialise:  initialise,
 		cleaner:     clean,
 		maxCapacity: poolConfig.maxCapacity,
-		metrics:     poolConfig.metrics, gcInner: nil, gcFresh: atomic.Int64{}, shards: nil, slabs: nil, capacity: 0, inFlight: atomic.Int64{}, slabsMu: sync.Mutex{}, shardMask: 0}
+		metrics:     poolConfig.metrics, gcInner: nil, gcFresh: atomic.Int64{}, shards: nil, slabs: nil, capacity: 0, inFlight: atomic.Int64{}, slabsMu: sync.Mutex{}, shardMask: 0,
+		overflow: nil, shardLimit: 0}
 	if err := p.bootstrapStorage(poolConfig, initialise, capacity); err != nil {
 		return nil, err
 	}
@@ -148,10 +158,12 @@ func New[T any](initialise func(*T), clean func(*T), capacity int, options ...Op
 }
 
 // Get returns an object from the pool, or nil when the pool is drained and growth is
-// exhausted. In ModeGCAware, Get always succeeds via the initialise function.
+// exhausted. In ModeGCAware, or in persistent mode with WithOverflow, Get always
+// succeeds. A drained pool then hands out an object from the garbage-collector-aware
+// overflow.
 //
-// Returns *T which is a pooled object, or nil when the persistent pool is drained and
-// growth is exhausted.
+// Returns *T which is a pooled object, or nil when the persistent pool is drained, growth
+// is exhausted and overflow is not enabled.
 func (p *Pool[T]) Get() *T {
 	if p.mode == ModeGCAware {
 		object := p.popGCInner()
@@ -231,7 +243,10 @@ func (p *Pool[T]) Put(object *T) {
 		return
 	}
 	runtimeProcUnpin()
-	s.pushFree(object)
+	if s.pushFree(object, p.shardLimit) {
+		return
+	}
+	p.overflow.Put(object)
 }
 
 // InFlight returns the number of objects handed out by Get() but not yet returned by
@@ -313,6 +328,9 @@ func (p *Pool[T]) bootstrapStorage(poolConfig config[T], initialise func(*T), ca
 		shardN := nextPow2(poolConfig.shards)
 		p.shards = make([]shard[T], shardN)
 		p.shardMask = safeconv.IntToUint32(shardN - 1)
+		if poolConfig.overflow {
+			p.enableOverflow(initialise, max(capacity, poolConfig.maxCapacity), shardN)
+		}
 		return p.appendSlab(capacity, 0)
 	case ModeGCAware:
 		p.gcInner = &sync.Pool{
@@ -382,6 +400,23 @@ func (p *Pool[T]) drainGCInner() []*T {
 	return out
 }
 
+// enableOverflow sets up the garbage-collector-aware overflow and the per-shard retention
+// limit for a persistent pool.
+//
+// Takes initialise (func(*T)) which builds a fresh object for the overflow.
+// Takes retained (int) which is the most objects the shards keep between them.
+// Takes shardCount (int) which is the number of shards.
+func (p *Pool[T]) enableOverflow(initialise func(*T), retained, shardCount int) {
+	p.overflow = &sync.Pool{
+		New: func() any {
+			object := new(T)
+			initialise(object)
+			return object
+		},
+	}
+	p.shardLimit = (retained + shardCount - 1) / shardCount
+}
+
 // appendSlab allocates one slab of individually heap-allocated objects and distributes
 // them across shards starting at preferShard, sidestepping the GC bitmap pessimisation
 // for arrays of large pointer-bearing values.
@@ -403,7 +438,7 @@ func (p *Pool[T]) appendSlab(size int, preferShard int) error {
 	mask := safeconv.IntToUint32(len(p.shards) - 1)
 	for i := range objects {
 		shardIdx := safeconv.IntToUint32Truncate(preferShard+i) & mask
-		p.shards[shardIdx].pushFree(objects[i])
+		p.shards[shardIdx].pushFree(objects[i], 0)
 	}
 	return nil
 }
@@ -431,7 +466,15 @@ func (p *Pool[T]) getPersistent() *T {
 	if object := p.steal(int(shardID)); object != nil {
 		return object
 	}
-	return p.grow(int(shardID))
+	if object := p.grow(int(shardID)); object != nil {
+		return object
+	}
+	if p.overflow != nil {
+		if object, ok := p.overflow.Get().(*T); ok {
+			return object
+		}
+	}
+	return nil
 }
 
 // takeParked takes the object parked in the calling P's slot, or else the first object
@@ -532,6 +575,9 @@ type config[T any] struct {
 
 	// metrics enables the in-flight counter when true.
 	metrics bool
+
+	// overflow enables the garbage-collector-aware overflow in persistent mode.
+	overflow bool
 }
 
 // WithMode selects the storage strategy.
@@ -561,6 +607,13 @@ func WithShardCount[T any](n int) Option[T] {
 // Returns Option[T] which records the growth ceiling in the configuration.
 func WithGrowth[T any](maxCapacity int) Option[T] {
 	return func(c *config[T]) { c.maxCapacity = maxCapacity }
+}
+
+// WithOverflow lets a persistent pool serve beyond its slabs.
+//
+// Returns Option[T] which records the overflow opt-in in the configuration.
+func WithOverflow[T any]() Option[T] {
+	return func(c *config[T]) { c.overflow = true }
 }
 
 // WithMetrics enables the in-flight counter queryable via Pool.InFlight, at the cost of

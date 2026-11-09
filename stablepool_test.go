@@ -423,3 +423,50 @@ func TestConcurrentGetPut(t *testing.T) {
 	require.Equal(t, int64(0), pool.InFlight())
 	require.Len(t, pool.Drain(), capacity, "every object is back in the pool")
 }
+
+func TestOverflowServesBeyondTheSlabs(t *testing.T) {
+	t.Parallel()
+	init, _ := newCounterInit()
+	pool, err := stablepool.New(init, nil, 2, stablepool.WithShardCount[buffer](1), stablepool.WithOverflow[buffer]())
+	require.NoError(t, err)
+
+	seen := make(map[int]bool)
+	for range 5 {
+		object := pool.Get()
+		require.NotNil(t, object, "a drained pool with overflow still hands out objects")
+		require.False(t, seen[object.id])
+		seen[object.id] = true
+	}
+}
+
+func TestOverflowKeepsReuseWhenObjectsLeak(t *testing.T) {
+	t.Parallel()
+	init, counter := newCounterInit()
+	pool, err := stablepool.New(init, nil, 2, stablepool.WithShardCount[buffer](1), stablepool.WithOverflow[buffer]())
+	require.NoError(t, err)
+
+	leaked := []*buffer{pool.Get(), pool.Get()}
+	require.NotNil(t, leaked[0])
+	require.NotNil(t, leaked[1])
+
+	object := pool.Get()
+	require.NotNil(t, object)
+	built := counter.Load()
+	pool.Put(object)
+	for range 10 {
+		reused := pool.Get()
+		require.Same(t, object, reused, "a returned overflow object is kept for reuse while slab objects are lost")
+		pool.Put(reused)
+	}
+	require.Equal(t, built, counter.Load(), "reuse builds no new objects")
+}
+
+func TestWithoutOverflowADrainedPoolStillReturnsNil(t *testing.T) {
+	t.Parallel()
+	init, _ := newCounterInit()
+	pool, err := stablepool.New(init, nil, 1, stablepool.WithShardCount[buffer](1))
+	require.NoError(t, err)
+
+	require.NotNil(t, pool.Get())
+	require.Nil(t, pool.Get())
+}
