@@ -50,14 +50,21 @@
 //
 // Get() and Put() are safe for any number of concurrent goroutines. Each goroutine takes
 // a per-P fast slot under runtime.procPin() (non-atomic in non-race builds,
-// atomic.Pointer in race builds), then falls through to a sharded counted-pointer Treiber
-// free stack on miss, and finally to a cross-shard steal walk. Growth, if enabled via
-// WithGrowth(), appends new slabs under a single mutex. Growth events are rare and only
-// fire when every shard is empty.
+// atomic.Pointer in race builds), then falls through to a sharded free stack on miss, and
+// finally to a cross-shard steal walk. Growth, if enabled via WithGrowth(), appends new
+// slabs under a single mutex. Growth events are rare and only fire when every shard is
+// empty.
 //
-// The free stack is ABA-safe. A 16-bit generation counter is packed into the high bits of
-// the 48-bit slab-slot pointer. Every successful CAS bumps the counter, closing the
-// Treiber ABA window.
+// Each shard's free stack is an intrusive list guarded by a per-shard mutex. A lock-free
+// Treiber stack would suffer ABA here and could link an in-use object into the list.
+//
+// # Bounded retention
+//
+// Put keeps every object it is given, so after a burst served by MustGet the pool holds
+// the burst's peak. TryPut keeps an object only while the pool holds fewer than its
+// capacity (the larger of the initial capacity and the WithGrowth ceiling) and otherwise
+// leaves it with the caller. WithOverflow bounds Put the same way and hands the surplus to
+// an internal sync.Pool.
 //
 // # Intrusive Link
 //

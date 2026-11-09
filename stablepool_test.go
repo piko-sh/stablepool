@@ -470,3 +470,96 @@ func TestWithoutOverflowADrainedPoolStillReturnsNil(t *testing.T) {
 	require.NotNil(t, pool.Get())
 	require.Nil(t, pool.Get())
 }
+
+func TestTryPutRefusesBeyondCapacity(t *testing.T) {
+	t.Parallel()
+	init, _ := newCounterInit()
+	var cleaned atomic.Int64
+	pool, err := stablepool.New(init, func(*buffer) { cleaned.Add(1) }, 2,
+		stablepool.WithShardCount[buffer](1), stablepool.WithMetrics[buffer]())
+	require.NoError(t, err)
+
+	taken := []*buffer{pool.MustGet(), pool.MustGet(), pool.MustGet(), pool.MustGet()}
+	kept := 0
+	for _, object := range taken {
+		if pool.TryPut(object) {
+			kept++
+		}
+	}
+	require.Equal(t, 3, kept, "the slot and the shard's share of two are kept; the rest are refused")
+	require.Equal(t, int64(4), cleaned.Load(), "the clean function runs on refused objects too")
+	require.Equal(t, int64(0), pool.InFlight(), "a refused object no longer counts as in flight")
+	require.Len(t, takeAll(t, pool), 3)
+}
+
+func TestTryPutCountsGrowthTowardsCapacity(t *testing.T) {
+	t.Parallel()
+	init, _ := newCounterInit()
+	pool, err := stablepool.New(init, nil, 1, stablepool.WithShardCount[buffer](1), stablepool.WithGrowth[buffer](3))
+	require.NoError(t, err)
+
+	taken := make([]*buffer, 0, 5)
+	for range 5 {
+		taken = append(taken, pool.MustGet())
+	}
+	kept := 0
+	for _, object := range taken {
+		if pool.TryPut(object) {
+			kept++
+		}
+	}
+	require.Equal(t, 4, kept, "the slot and the growth ceiling of three are kept")
+}
+
+func TestTryPutInGCAwareModeAlwaysKeeps(t *testing.T) {
+	t.Parallel()
+	init, _ := newCounterInit()
+	pool, err := stablepool.New(init, nil, 1, stablepool.WithMode[buffer](stablepool.ModeGCAware))
+	require.NoError(t, err)
+	for range 4 {
+		require.True(t, pool.TryPut(pool.MustGet()))
+	}
+}
+
+func TestTryPutIgnoresNil(t *testing.T) {
+	t.Parallel()
+	init, _ := newCounterInit()
+	pool, err := stablepool.New(init, nil, 1)
+	require.NoError(t, err)
+	require.True(t, pool.TryPut(nil), "there is nothing for the caller to dispose of")
+}
+
+func TestPutWithoutOverflowKeepsEveryObject(t *testing.T) {
+	t.Parallel()
+	init, _ := newCounterInit()
+	pool, err := stablepool.New(init, nil, 1, stablepool.WithShardCount[buffer](1))
+	require.NoError(t, err)
+
+	taken := []*buffer{pool.MustGet(), pool.MustGet(), pool.MustGet()}
+	for _, object := range taken {
+		pool.Put(object)
+	}
+	require.Len(t, takeAll(t, pool), 3, "Put keeps its unbounded behaviour; TryPut is the bounded form")
+}
+
+func TestConcurrentTryPutStaysWithinCapacity(t *testing.T) {
+	t.Parallel()
+	init, _ := newCounterInit()
+	const shards, capacity = 4, 8
+	pool, err := stablepool.New(init, nil, capacity, stablepool.WithShardCount[buffer](shards))
+	require.NoError(t, err)
+
+	var group sync.WaitGroup
+	for range 16 {
+		group.Go(func() {
+			for range 500 {
+				held := []*buffer{pool.MustGet(), pool.MustGet(), pool.MustGet()}
+				for _, object := range held {
+					pool.TryPut(object)
+				}
+			}
+		})
+	}
+	group.Wait()
+	require.LessOrEqual(t, len(pool.Drain()), capacity+shards, "the free stacks keep at most the capacity, plus one parked object per shard")
+}

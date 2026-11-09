@@ -109,8 +109,8 @@ type Pool[T any] struct {
 	// from a fresh one (sync.Pool.Get() never reports nil once New is set).
 	gcFresh atomic.Int64
 
-	// shardLimit is the most objects each shard's free stack keeps when overflow is set.
-	// Zero means no limit.
+	// shardLimit is each shard's share of the pool's capacity. It is the most objects the
+	// shard's free stack keeps on TryPut, or on Put when overflow is set.
 	shardLimit int
 
 	// slabsMu guards slabs and capacity during growth.
@@ -222,31 +222,45 @@ func (p *Pool[T]) Put(object *T) {
 	if object == nil {
 		return
 	}
-	if p.cleaner != nil {
-		p.cleaner(object)
-	}
-	if p.metrics {
-		p.inFlight.Add(-1)
-	}
-
+	p.release(object)
 	if p.mode == ModeGCAware {
 		p.gcInner.Put(object)
 		return
 	}
-
-	pid := runtimeProcPin()
-	shardID := safeconv.IntToUint32Truncate(pid) & p.shardMask
-	s := &p.shards[shardID]
-
-	if s.slot.tryPut(object) {
-		runtimeProcUnpin()
+	shardID, parked := p.park(object)
+	if parked {
 		return
 	}
-	runtimeProcUnpin()
-	if s.pushFree(object, p.shardLimit) {
+	if p.overflow == nil {
+		p.shards[shardID].pushFree(object, 0)
+		return
+	}
+	if p.pushWithinLimit(object, shardID) {
 		return
 	}
 	p.overflow.Put(object)
+}
+
+// TryPut returns an object to the pool only while the pool holds fewer objects than its
+// capacity, the larger of the initial capacity and the growth ceiling.
+//
+// Takes object (*T) which is the object to return. A nil value is ignored.
+//
+// Returns bool which is false when the pool is full and the caller still owns object.
+func (p *Pool[T]) TryPut(object *T) bool {
+	if object == nil {
+		return true
+	}
+	p.release(object)
+	if p.mode == ModeGCAware {
+		p.gcInner.Put(object)
+		return true
+	}
+	shardID, parked := p.park(object)
+	if parked {
+		return true
+	}
+	return p.pushWithinLimit(object, shardID)
 }
 
 // InFlight returns the number of objects handed out by Get() but not yet returned by
@@ -328,8 +342,10 @@ func (p *Pool[T]) bootstrapStorage(poolConfig config[T], initialise func(*T), ca
 		shardN := nextPow2(poolConfig.shards)
 		p.shards = make([]shard[T], shardN)
 		p.shardMask = safeconv.IntToUint32(shardN - 1)
+		retained := max(capacity, poolConfig.maxCapacity)
+		p.shardLimit = (retained + shardN - 1) / shardN
 		if poolConfig.overflow {
-			p.enableOverflow(initialise, max(capacity, poolConfig.maxCapacity), shardN)
+			p.enableOverflow(initialise)
 		}
 		return p.appendSlab(capacity, 0)
 	case ModeGCAware:
@@ -400,13 +416,10 @@ func (p *Pool[T]) drainGCInner() []*T {
 	return out
 }
 
-// enableOverflow sets up the garbage-collector-aware overflow and the per-shard retention
-// limit for a persistent pool.
+// enableOverflow sets up the garbage-collector-aware overflow for a persistent pool.
 //
 // Takes initialise (func(*T)) which builds a fresh object for the overflow.
-// Takes retained (int) which is the most objects the shards keep between them.
-// Takes shardCount (int) which is the number of shards.
-func (p *Pool[T]) enableOverflow(initialise func(*T), retained, shardCount int) {
+func (p *Pool[T]) enableOverflow(initialise func(*T)) {
 	p.overflow = &sync.Pool{
 		New: func() any {
 			object := new(T)
@@ -414,7 +427,49 @@ func (p *Pool[T]) enableOverflow(initialise func(*T), retained, shardCount int) 
 			return object
 		},
 	}
-	p.shardLimit = (retained + shardCount - 1) / shardCount
+}
+
+// release runs the clean function and drops the in-flight count for an object leaving the
+// caller's hands.
+//
+// Takes object (*T) which is the returned object; must be non-nil.
+func (p *Pool[T]) release(object *T) {
+	if p.cleaner != nil {
+		p.cleaner(object)
+	}
+	if p.metrics {
+		p.inFlight.Add(-1)
+	}
+}
+
+// park offers object to the calling P's slot.
+//
+// Takes object (*T) which is the object to park; must be non-nil.
+//
+// Returns uint32 which is the calling P's shard.
+// Returns bool which is true when the slot took object.
+func (p *Pool[T]) park(object *T) (uint32, bool) {
+	pid := runtimeProcPin()
+	shardID := safeconv.IntToUint32Truncate(pid) & p.shardMask
+	parked := p.shards[shardID].slot.tryPut(object)
+	runtimeProcUnpin()
+	return shardID, parked
+}
+
+// pushWithinLimit pushes object onto the first shard, from start onwards, whose free stack
+// holds fewer than shardLimit objects.
+//
+// Takes object (*T) which is the object to push; must be non-nil.
+// Takes start (uint32) which is the calling P's shard, tried first.
+//
+// Returns bool which is false when every shard is full and object was not pushed.
+func (p *Pool[T]) pushWithinLimit(object *T, start uint32) bool {
+	for offset := uint32(0); offset <= p.shardMask; offset++ {
+		if p.shards[(start+offset)&p.shardMask].pushFree(object, p.shardLimit) {
+			return true
+		}
+	}
+	return false
 }
 
 // appendSlab allocates one slab of individually heap-allocated objects and distributes

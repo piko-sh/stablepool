@@ -59,23 +59,27 @@ func main() {
 - **`Get`** returns a pooled object or nil when the pool is empty and cannot grow;
   **`MustGet`** allocates a fresh object instead of returning nil; **`GetPreferParked`**
   takes an object parked in any processor's slot first. **`Put`** runs the clean function and
-  returns the object.
+  returns the object. **`TryPut`** returns it only while the pool holds fewer objects than its
+  capacity, and otherwise reports false and leaves the object with you. Use it for objects
+  that need teardown the garbage collector can't do, so a burst's surplus is released properly
+  instead of being kept forever.
 - **Options**: `WithGrowth` (extra slabs on demand up to a ceiling), `WithShardCount`
   (default `GOMAXPROCS`, rounded up to a power of two), `WithMetrics` (an in-flight counter,
   read with `InFlight`), `WithOverflow` (see below), and `WithMode(ModeGCAware)` for
   `sync.Pool` reclamation behind the same typed API.
 - **`WithOverflow`** lets a persistent pool serve beyond its slabs. When they run out, `Get`
   falls back to an internal `sync.Pool` instead of returning nil. Each shard keeps no more
-  than its share of the slab capacity, so the surplus from a burst goes back to the garbage
-  collector. Leaked objects still pin their slab slots, but returned overflow objects take
-  their place on the free stacks, so the pool keeps reusing objects.
+  than its share of the capacity, and `Put` tries every shard before handing an object to the
+  overflow, so only the surplus from a burst goes back to the garbage collector. Leaked
+  objects still pin their slab slots, but returned overflow objects take their place on the
+  free stacks, so the pool keeps reusing objects.
 - **`Cap`**, **`MaxCap`** and **`Drain`** report and empty the pool.
 - **Sentinel errors** for invalid construction: `ErrNoInitialiser`, `ErrBadCapacity`,
   `ErrBadGrowth`, `ErrBadShardCount` and `ErrBadLink`.
 
 `Get` and `Put` are safe for any number of goroutines. Each takes a per-processor fast slot,
-then a sharded, ABA-safe Treiber free stack, then steals from other shards; growth takes a
-single mutex and only happens when every shard is empty.
+then a sharded free stack guarded by a per-shard mutex, then steals from other shards; growth
+takes a single mutex and only happens when every shard is empty.
 
 ## Build tags
 

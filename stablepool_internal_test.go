@@ -132,3 +132,40 @@ func TestOverflowBoundsWhatTheShardsKeep(t *testing.T) {
 	require.LessOrEqual(t, kept, 1+pool.shardLimit, "the shard keeps its slot and at most its share; the rest go to the overflow")
 	require.Equal(t, 5, kept)
 }
+
+func TestTryPutWalksToAShardWithRoom(t *testing.T) {
+	pool, own := newParkedPool(t)
+	require.Equal(t, 1, pool.shardLimit)
+	emptyFreeStacks(pool)
+	require.True(t, pool.shards[own].slot.tryPut(&parkedObject{}))
+	require.True(t, pool.shards[own].pushFree(&parkedObject{}, 0))
+
+	object := &parkedObject{}
+	require.True(t, pool.TryPut(object), "another shard has room")
+	require.Same(t, object, pool.shards[(own+1)&pool.shardMask].popFree())
+}
+
+func TestTryPutRefusesWhenEveryShardIsFull(t *testing.T) {
+	pool, own := newParkedPool(t)
+	require.True(t, pool.shards[own].slot.tryPut(&parkedObject{}))
+
+	require.False(t, pool.TryPut(&parkedObject{}), "each shard holds its share of the capacity of four")
+}
+
+func TestOverflowWalksTheShardsBeforeTheOverflow(t *testing.T) {
+	pool, own := newParkedPool(t, WithOverflow[parkedObject]())
+	emptyFreeStacks(pool)
+	require.True(t, pool.shards[own].slot.tryPut(&parkedObject{}))
+	require.True(t, pool.shards[own].pushFree(&parkedObject{}, 0))
+
+	object := &parkedObject{}
+	pool.Put(object)
+	require.Same(t, object, pool.shards[(own+1)&pool.shardMask].popFree(), "a slab object stays on the free stacks rather than going to the overflow")
+}
+
+func emptyFreeStacks(pool *Pool[parkedObject]) {
+	for i := range pool.shards {
+		for pool.shards[i].popFree() != nil {
+		}
+	}
+}
